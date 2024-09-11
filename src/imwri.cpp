@@ -32,6 +32,7 @@
 #include <vector>
 #include <algorithm>
 #include <memory>
+#include <functional>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -182,6 +183,150 @@ struct WriteData {
     WriteData() : videoNode(nullptr), alphaNode(nullptr), vi(nullptr), quality(0), compressType(MagickCore::UndefinedCompression), dither(true) {}
 };
 
+#if defined(__SSE2__) || (defined(_MSC_VER) && !defined(__clang__) && ((defined(_M_IX86_FP) && _M_IX86_FP == 2) || defined(_M_X64)))
+#include <emmintrin.h>
+#define HAVE_SSE2 1
+
+static inline void ssePackPair8(__m128i &outLo, __m128i &outHi, __m128i a, __m128i b) {
+    outLo = _mm_packus_epi16(
+        _mm_and_si128(a, _mm_set1_epi16(0xff)),
+        _mm_and_si128(b, _mm_set1_epi16(0xff))
+    );
+    outHi = _mm_packus_epi16(
+        _mm_srli_epi16(a, 8), _mm_srli_epi16(b, 8)
+    );
+}
+static inline void ssePackPair16(__m128i &outLo, __m128i &outHi, __m128i a, __m128i b) {
+    // swap middle two 16-bit words in every 64-bit block
+    a = _mm_shufflehi_epi16(_mm_shufflelo_epi16(a, _MM_SHUFFLE(3,1,2,0)), _MM_SHUFFLE(3,1,2,0));
+    b = _mm_shufflehi_epi16(_mm_shufflelo_epi16(b, _MM_SHUFFLE(3,1,2,0)), _MM_SHUFFLE(3,1,2,0));
+
+    // pull alternating 32-bit blocks
+    outLo = _mm_castps_si128(_mm_shuffle_ps(
+        _mm_castsi128_ps(a), _mm_castsi128_ps(b), _MM_SHUFFLE(2,0,2,0)
+    ));
+    outHi = _mm_castps_si128(_mm_shuffle_ps(
+        _mm_castsi128_ps(a), _mm_castsi128_ps(b), _MM_SHUFFLE(3,1,3,1)
+    ));
+}
+
+template <std::size_t N>
+static inline void sseWritePixels8(void *dst, const __m128i (&vecs)[N]) {
+#ifdef MAGICKCORE_HDRI_SUPPORT
+    // pixels are always 32-bit float
+    float *p = reinterpret_cast<float*>(dst);
+    for (__m128i vec : vecs) {
+        __m128i vec0, vec1;
+        if (MAGICKCORE_QUANTUM_DEPTH == 8) {
+            vec0 = _mm_unpacklo_epi8(vec, _mm_setzero_si128());
+            vec1 = _mm_unpackhi_epi8(vec, _mm_setzero_si128());
+        } else {
+            vec0 = _mm_unpacklo_epi8(vec, vec);
+            vec1 = _mm_unpackhi_epi8(vec, vec);
+        }
+
+        __m128 vec00 = _mm_cvtepi32_ps(_mm_unpacklo_epi16(vec0, _mm_setzero_si128()));
+        __m128 vec01 = _mm_cvtepi32_ps(_mm_unpackhi_epi16(vec0, _mm_setzero_si128()));
+        __m128 vec10 = _mm_cvtepi32_ps(_mm_unpacklo_epi16(vec1, _mm_setzero_si128()));
+        __m128 vec11 = _mm_cvtepi32_ps(_mm_unpackhi_epi16(vec1, _mm_setzero_si128()));
+        if (MAGICKCORE_QUANTUM_DEPTH == 32) {
+            vec00 = _mm_mul_ps(vec00, _mm_set1_ps(65537.0));
+            vec01 = _mm_mul_ps(vec01, _mm_set1_ps(65537.0));
+            vec10 = _mm_mul_ps(vec10, _mm_set1_ps(65537.0));
+            vec11 = _mm_mul_ps(vec11, _mm_set1_ps(65537.0));
+        }
+        _mm_storeu_ps(p, vec00);
+        _mm_storeu_ps(p + 4, vec01);
+        _mm_storeu_ps(p + 8, vec10);
+        _mm_storeu_ps(p +12, vec11);
+        p += 16;
+    }
+#else
+    __m128i *p = reinterpret_cast<__m128i*>(dst);
+    if (sizeof(MagickCore::Quantum) == 1) {
+        for (__m128i vec : vecs)
+            _mm_storeu_si128(p++, vec);
+    } else {
+        for (__m128i vec : vecs) {
+            __m128i vec0, vec1;
+            if (MAGICKCORE_QUANTUM_DEPTH == 8) {
+                vec0 = _mm_unpacklo_epi8(vec, _mm_setzero_si128());
+                vec1 = _mm_unpackhi_epi8(vec, _mm_setzero_si128());
+            } else {
+                vec0 = _mm_unpacklo_epi8(vec, vec);
+                vec1 = _mm_unpackhi_epi8(vec, vec);
+            }
+            if (sizeof(MagickCore::Quantum) == 4) {
+                if (MAGICKCORE_QUANTUM_DEPTH == 32) {
+                    _mm_storeu_si128(p++, _mm_unpacklo_epi16(vec0, vec0));
+                    _mm_storeu_si128(p++, _mm_unpackhi_epi16(vec0, vec0));
+                    _mm_storeu_si128(p++, _mm_unpacklo_epi16(vec1, vec1));
+                    _mm_storeu_si128(p++, _mm_unpackhi_epi16(vec1, vec1));
+                } else { // 8 or 16
+                    _mm_storeu_si128(p++, _mm_unpacklo_epi16(vec0, _mm_setzero_si128()));
+                    _mm_storeu_si128(p++, _mm_unpackhi_epi16(vec0, _mm_setzero_si128()));
+                    _mm_storeu_si128(p++, _mm_unpacklo_epi16(vec1, _mm_setzero_si128()));
+                    _mm_storeu_si128(p++, _mm_unpackhi_epi16(vec1, _mm_setzero_si128()));
+                }
+            } else { // sizeof(MagickCore::Quantum) == 2
+                _mm_storeu_si128(p++, vec0);
+                _mm_storeu_si128(p++, vec1);
+            }
+        }
+    }
+#endif
+}
+template <std::size_t N>
+static inline void sseWritePixels16(void *dst, const __m128i (&vecs)[N]) {
+#ifdef MAGICKCORE_HDRI_SUPPORT
+    // pixels are always 32-bit float (64-bit float unsupported here)
+    float *p = reinterpret_cast<float*>(dst);
+    for (__m128i vec : vecs) {
+        if (MAGICKCORE_QUANTUM_DEPTH == 8)
+            vec = _mm_srli_epi16(vec, 8);
+
+        __m128 vec0 = _mm_cvtepi32_ps(_mm_unpacklo_epi16(vec, _mm_setzero_si128()));
+        __m128 vec1 = _mm_cvtepi32_ps(_mm_unpackhi_epi16(vec, _mm_setzero_si128()));
+        if (MAGICKCORE_QUANTUM_DEPTH == 32) {
+            vec0 = _mm_mul_ps(vec0, _mm_set1_ps(65537.0));
+            vec1 = _mm_mul_ps(vec1, _mm_set1_ps(65537.0));
+        }
+        _mm_storeu_ps(p, vec0);
+        _mm_storeu_ps(p + 4, vec1);
+        p += 8;
+    }
+#else
+    __m128i *p = reinterpret_cast<__m128i*>(dst);
+    if (sizeof(MagickCore::Quantum) == 1) {
+        for (int i = 0; i < N; i += 2) {
+            __m128i vec0 = vecs[i], vec1 = vecs[i + 1];
+            vec0 = _mm_srli_epi16(vec0, 8); // should rounding be done here?
+            vec1 = _mm_srli_epi16(vec1, 8);
+            _mm_storeu_si128(p++, _mm_packus_epi16(vec0, vec1));
+        }
+    } else {
+        for (__m128i vec : vecs) {
+            if (sizeof(MagickCore::Quantum) == 4) {
+                if (MAGICKCORE_QUANTUM_DEPTH == 32) {
+                    _mm_storeu_si128(p++, _mm_unpacklo_epi16(vec, vec));
+                    _mm_storeu_si128(p++, _mm_unpackhi_epi16(vec, vec));
+                } else { // 8 or 16
+                    if (MAGICKCORE_QUANTUM_DEPTH == 8)
+                        vec = _mm_srli_epi16(vec, 8);
+                    _mm_storeu_si128(p++, _mm_unpacklo_epi16(vec, _mm_setzero_si128()));
+                    _mm_storeu_si128(p++, _mm_unpackhi_epi16(vec, _mm_setzero_si128()));
+                }
+            } else { // sizeof(MagickCore::Quantum) == 2
+                if (MAGICKCORE_QUANTUM_DEPTH == 8)
+                    vec = _mm_srli_epi16(vec, 8);
+                _mm_storeu_si128(p++, vec);
+            }
+        }
+    }
+#endif
+}
+#endif
+
 template<typename T>
 static void writeImageHelper(const VSFrame *frame, const VSFrame *alphaFrame, bool isGray, Magick::Image &image, int width, int height, int bitsPerSample, const VSAPI *vsapi) {
     unsigned prepeat = (MAGICKCORE_QUANTUM_DEPTH - 1) / bitsPerSample;
@@ -212,37 +357,205 @@ static void writeImageHelper(const VSFrame *frame, const VSFrame *alphaFrame, bo
         ptrdiff_t strideA = vsapi->getStride(alphaFrame, 0);
         const T * VS_RESTRICT a = reinterpret_cast<const T *>(vsapi->getReadPtr(alphaFrame, 0));
 
-        for (int y = 0; y < height; y++) {
-            MagickCore::Quantum *pixels = pixelCache.get(0, y, width, 1);
-            for (int x = 0; x < width; x++) {
-                pixels[x * channels + rOff] = r[x] * scaleFactor + (r[x] >> shiftFactor);
-                pixels[x * channels + gOff] = g[x] * scaleFactor + (g[x] >> shiftFactor);
-                pixels[x * channels + bOff] = b[x] * scaleFactor + (b[x] >> shiftFactor);
-                pixels[x * channels + aOff] = a[x] * scaleFactor + (a[x] >> shiftFactor);
+        auto loopImage = [&](const std::function<void(MagickCore::Quantum *, int &)> &loopPixels) {
+            for (int y = 0; y < height; y++) {
+                MagickCore::Quantum *pixels = pixelCache.get(0, y, width, 1);
+                int x = 0;
+                loopPixels(pixels, x);
+                for (; x < width; x++) {
+                    pixels[x * channels + rOff] = r[x] * scaleFactor + (r[x] >> shiftFactor);
+                    pixels[x * channels + gOff] = g[x] * scaleFactor + (g[x] >> shiftFactor);
+                    pixels[x * channels + bOff] = b[x] * scaleFactor + (b[x] >> shiftFactor);
+                    pixels[x * channels + aOff] = a[x] * scaleFactor + (a[x] >> shiftFactor);
+                }
+
+                r += strideR / sizeof(T);
+                g += strideG / sizeof(T);
+                b += strideB / sizeof(T);
+                a += strideA / sizeof(T);
+
+                pixelCache.sync();
             }
+        };
+#ifdef HAVE_SSE2
+        if (sizeof(MagickCore::Quantum) <= 4 && MAGICKCORE_QUANTUM_DEPTH <= 32 && channels == 4 && rOff == 0 && gOff == 1 && bOff == 2 && aOff == 3) { // typical ImageMagick config
+            if (sizeof(T) == 1 && bitsPerSample == 8) {
+                loopImage([&](MagickCore::Quantum *pixels, int &x) {
+                    for (; x < width - 15; x += 16) {
+                        __m128i r0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(r + x));
+                        __m128i g0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(g + x));
+                        __m128i b0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + x));
+                        __m128i a0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + x));
 
-            r += strideR / sizeof(T);
-            g += strideG / sizeof(T);
-            b += strideB / sizeof(T);
-            a += strideA / sizeof(T);
+                        // interleave
+                        __m128i rg0 = _mm_unpacklo_epi8(r0, g0);
+                        __m128i rg1 = _mm_unpackhi_epi8(r0, g0);
+                        __m128i ba0 = _mm_unpacklo_epi8(b0, a0);
+                        __m128i ba1 = _mm_unpackhi_epi8(b0, a0);
 
-            pixelCache.sync();
+                        __m128i rgba0 = _mm_unpacklo_epi16(rg0, ba0);
+                        __m128i rgba1 = _mm_unpackhi_epi16(rg0, ba0);
+                        __m128i rgba2 = _mm_unpacklo_epi16(rg1, ba1);
+                        __m128i rgba3 = _mm_unpackhi_epi16(rg1, ba1);
+
+                        sseWritePixels8(pixels + x * channels, (const __m128i[4]){
+                            rgba0, rgba1, rgba2, rgba3
+                        });
+                    }
+                });
+                return;
+            } else if (sizeof(T) == 2 && bitsPerSample >= 8 && (MAGICKCORE_QUANTUM_DEPTH <= 16 || bitsPerSample == 8 || bitsPerSample == 16)) { // TODO: consider supporting proper upsampling to 32-bit
+                loopImage([&](MagickCore::Quantum *pixels, int &x) {
+                    __m128i shl = _mm_set_epi32(0, bitsPerSample * 2 - 16, 0, 16 - bitsPerSample);
+                    __m128i shr = _mm_unpackhi_epi64(shl, shl);
+                    for (; x < width - 7; x += 8) {
+                        __m128i r0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(r + x));
+                        __m128i g0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(g + x));
+                        __m128i b0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + x));
+                        __m128i a0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + x));
+
+                        // upsample pixels to 16-bit
+                        r0 = _mm_or_si128(_mm_sll_epi16(r0, shl), _mm_srl_epi16(r0, shr));
+                        g0 = _mm_or_si128(_mm_sll_epi16(g0, shl), _mm_srl_epi16(g0, shr));
+                        b0 = _mm_or_si128(_mm_sll_epi16(b0, shl), _mm_srl_epi16(b0, shr));
+                        a0 = _mm_or_si128(_mm_sll_epi16(a0, shl), _mm_srl_epi16(a0, shr));
+
+                        // interleave
+                        __m128i rg0 = _mm_unpacklo_epi16(r0, g0);
+                        __m128i rg1 = _mm_unpackhi_epi16(r0, g0);
+                        __m128i ba0 = _mm_unpacklo_epi16(b0, a0);
+                        __m128i ba1 = _mm_unpackhi_epi16(b0, a0);
+
+                        sseWritePixels16(pixels + x * channels, (const __m128i[4]){
+                            _mm_unpacklo_epi32(rg0, ba0),
+                            _mm_unpackhi_epi32(rg0, ba0),
+                            _mm_unpacklo_epi32(rg1, ba1),
+                            _mm_unpackhi_epi32(rg1, ba1)
+                        });
+                    }
+                });
+                return;
+            }
         }
+#endif
+        loopImage([&](MagickCore::Quantum *pixels, int &x) {});
     } else {
-        for (int y = 0; y < height; y++) {
-            MagickCore::Quantum *pixels = pixelCache.get(0, y, width, 1);
-            for (int x = 0; x < width; x++) {
-                pixels[x * channels + rOff] = r[x] * scaleFactor + (r[x] >> shiftFactor);
-                pixels[x * channels + gOff] = g[x] * scaleFactor + (g[x] >> shiftFactor);
-                pixels[x * channels + bOff] = b[x] * scaleFactor + (b[x] >> shiftFactor);
+        auto loopImage = [&](const std::function<void(MagickCore::Quantum *, int &)> &loopPixels) {
+            for (int y = 0; y < height; y++) {
+                MagickCore::Quantum *pixels = pixelCache.get(0, y, width, 1);
+                int x = 0;
+                loopPixels(pixels, x);
+                for (; x < width; x++) {
+                    pixels[x * channels + rOff] = r[x] * scaleFactor + (r[x] >> shiftFactor);
+                    pixels[x * channels + gOff] = g[x] * scaleFactor + (g[x] >> shiftFactor);
+                    pixels[x * channels + bOff] = b[x] * scaleFactor + (b[x] >> shiftFactor);
+                }
+
+                r += strideR / sizeof(T);
+                g += strideG / sizeof(T);
+                b += strideB / sizeof(T);
+
+                pixelCache.sync();
             }
+        };
 
-            r += strideR / sizeof(T);
-            g += strideG / sizeof(T);
-            b += strideB / sizeof(T);
+#ifdef HAVE_SSE2
+        if (sizeof(MagickCore::Quantum) <= 4 && MAGICKCORE_QUANTUM_DEPTH <= 32 && channels == 3 && rOff == 0 && gOff == 1 && bOff == 2) { // typical ImageMagick config
+            if (sizeof(T) == 1 && bitsPerSample == 8) {
+                loopImage([&](MagickCore::Quantum *pixels, int &x) {
+                    for (; x < width - 31; x += 32) {
+                        __m128i r0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(r + x));
+                        __m128i r1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(r + x) + 1);
+                        __m128i g0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(g + x));
+                        __m128i g1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(g + x) + 1);
+                        __m128i b0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + x));
+                        __m128i b1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + x) + 1);
 
-            pixelCache.sync();
+                        // interleave pixels via repeated packing
+                        __m128i r01a, r01b, g01a, g01b, b01a, b01b;
+                        ssePackPair8(r01a, r01b, r0, r1);
+                        ssePackPair8(g01a, g01b, g0, g1);
+                        ssePackPair8(b01a, b01b, b0, b1);
+
+                        __m128i rg0, rg2, gb1, gb3, br0, br2;
+                        ssePackPair8(rg0, rg2, r01a, g01a);
+                        ssePackPair8(gb1, gb3, g01b, b01b);
+                        ssePackPair8(br0, br2, b01a, r01b);
+
+                        __m128i rgbr0, rgbr1, gbrg0, gbrg1, brgb0, brgb1;
+                        ssePackPair8(rgbr0, rgbr1, rg0, br0);
+                        ssePackPair8(gbrg0, gbrg1, gb1, rg2);
+                        ssePackPair8(brgb0, brgb1, br2, gb3);
+
+                        __m128i r_g0, r_g1, b_r0, b_r1, g_b0, g_b1;
+                        ssePackPair8(r_g0, r_g1, rgbr0, gbrg0);
+                        ssePackPair8(b_r0, b_r1, brgb0, rgbr1);
+                        ssePackPair8(g_b0, g_b1, gbrg1, brgb1);
+
+                        __m128i r_r0, r_r1, g_g0, g_g1, b_b0, b_b1;
+                        ssePackPair8(r_r0, r_r1, r_g0, b_r0);
+                        ssePackPair8(g_g0, g_g1, g_b0, r_g1);
+                        ssePackPair8(b_b0, b_b1, b_r1, g_b1);
+
+                        sseWritePixels8(pixels + x * channels, (const __m128i[6]){
+                            r_r0, g_g0, b_b0,
+                            r_r1, g_g1, b_b1
+                        });
+                    }
+                });
+                return;
+            } else if (sizeof(T) == 2 && bitsPerSample >= 8 && (MAGICKCORE_QUANTUM_DEPTH <= 16 || bitsPerSample == 8 || bitsPerSample == 16)) {
+                loopImage([&](MagickCore::Quantum *pixels, int &x) {
+                    __m128i shl = _mm_set_epi32(0, bitsPerSample * 2 - 16, 0, 16 - bitsPerSample);
+                    __m128i shr = _mm_unpackhi_epi64(shl, shl);
+                    for (; x < width - 15; x += 16) {
+                        __m128i r0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(r + x));
+                        __m128i r1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(r + x) + 1);
+                        __m128i g0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(g + x));
+                        __m128i g1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(g + x) + 1);
+                        __m128i b0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + x));
+                        __m128i b1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + x) + 1);
+
+                        // upsample pixels to 16-bit
+                        r0 = _mm_or_si128(_mm_sll_epi16(r0, shl), _mm_srl_epi16(r0, shr));
+                        r1 = _mm_or_si128(_mm_sll_epi16(r1, shl), _mm_srl_epi16(r1, shr));
+                        g0 = _mm_or_si128(_mm_sll_epi16(g0, shl), _mm_srl_epi16(g0, shr));
+                        g1 = _mm_or_si128(_mm_sll_epi16(g1, shl), _mm_srl_epi16(g1, shr));
+                        b0 = _mm_or_si128(_mm_sll_epi16(b0, shl), _mm_srl_epi16(b0, shr));
+                        b1 = _mm_or_si128(_mm_sll_epi16(b1, shl), _mm_srl_epi16(b1, shr));
+
+                        // interleave pixels via repeated packing
+                        __m128i r01a, r01b, g01a, g01b, b01a, b01b;
+                        ssePackPair16(r01a, r01b, r0, r1);
+                        ssePackPair16(g01a, g01b, g0, g1);
+                        ssePackPair16(b01a, b01b, b0, b1);
+
+                        __m128i rg0, rg2, gb1, gb3, br0, br2;
+                        ssePackPair16(rg0, rg2, r01a, g01a);
+                        ssePackPair16(gb1, gb3, g01b, b01b);
+                        ssePackPair16(br0, br2, b01a, r01b);
+
+                        __m128i rgbr0, rgbr1, gbrg0, gbrg1, brgb0, brgb1;
+                        ssePackPair16(rgbr0, rgbr1, rg0, br0);
+                        ssePackPair16(gbrg0, gbrg1, gb1, rg2);
+                        ssePackPair16(brgb0, brgb1, br2, gb3);
+
+                        __m128i r_g0, r_g1, b_r0, b_r1, g_b0, g_b1;
+                        ssePackPair16(r_g0, r_g1, rgbr0, gbrg0);
+                        ssePackPair16(b_r0, b_r1, brgb0, rgbr1);
+                        ssePackPair16(g_b0, g_b1, gbrg1, brgb1);
+
+                        sseWritePixels16(pixels + x * channels, (const __m128i[6]){
+                            r_g0, b_r0, g_b0,
+                            r_g1, b_r1, g_b1
+                        });
+                    }
+                });
+                return;
+            }
         }
+#endif
+        loopImage([&](MagickCore::Quantum *pixels, int &x) {});
     }
 }
 
