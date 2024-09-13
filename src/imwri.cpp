@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <memory>
 #include <functional>
+#include <mutex>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -53,6 +54,10 @@
 #error ImageMagick must be compiled with HDRI enabled
 #endif
 
+#if MAGICKCORE_QUANTUM_DEPTH > 32
+#error Only up to 32-bit sample size supported
+#endif
+
 #if defined(MAGICKCORE_LCMS_DELEGATE)
 #define IMWRI_HAS_LCMS2
 #endif
@@ -63,18 +68,21 @@ using MagickCore::Quantum;
 //////////////////////////////////////////
 // Shared
 
+std::once_flag initMagickFlag;
 static void initMagick(VSCore *core, const VSAPI *vsapi) {
-    std::string path;
+    std::call_once(initMagickFlag, [=]() {
+        std::string path;
 #ifdef _WIN32
-    const char *pathPtr = vsapi->getPluginPath(vsapi->getPluginByID(IMWRI_ID, core));
-    if (pathPtr) {
-        path = pathPtr;
-        for (auto &c : path)
-            if (c == '/')
-                c = '\\';
-    }
+        const char *pathPtr = vsapi->getPluginPath(vsapi->getPluginByID(IMWRI_ID, core));
+        if (pathPtr) {
+            path = pathPtr;
+            for (auto &c : path)
+                if (c == '/')
+                    c = '\\';
+        }
 #endif
-    Magick::InitializeMagick(path.c_str());
+        Magick::InitializeMagick(path.c_str());
+    });
 }
 
 static std::string specialPrintf(const std::string &filename, int number) {
@@ -338,6 +346,10 @@ static void writeImageHelper(const VSFrame *frame, const VSFrame *alphaFrame, bo
         scaleFactor += 1;
     }
     scaleFactor <<= pleftover;
+
+    // basic downsampling support
+    if(bitsPerSample > MAGICKCORE_QUANTUM_DEPTH)
+        shiftFactor = bitsPerSample - MAGICKCORE_QUANTUM_DEPTH;
 
     Magick::Pixels pixelCache(image);
 
@@ -809,7 +821,6 @@ static void VS_CC writeCreate(const VSMap *in, VSMap *out, void *userData, VSCor
     d->filename = vsapi->mapGetData(in, "filename", 0, nullptr);
     d->overwrite = !!vsapi->mapGetInt(in, "overwrite", 0, &err);
 
-    d->vi = vsapi->getVideoInfo(d->videoNode);
     if (d->alphaNode) {
         const VSVideoInfo *alphaVi = vsapi->getVideoInfo(d->alphaNode);
         VSVideoFormat alphaFormat;
